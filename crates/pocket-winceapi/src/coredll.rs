@@ -815,6 +815,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegOpenKeyExW", reg_open_key_ex_w);
     d.register_handler(dll, "RegCreateKeyExW", reg_create_key_ex_w);
     d.register_handler(dll, "RegQueryValueExW", reg_query_value_ex_w);
+    d.register_handler(dll, "RegQueryInfoKeyW", reg_query_info_key_w);
     d.register_handler(dll, "RegSetValueExW", reg_set_value_ex_w);
     d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
     d.register_handler(dll, "RegCloseKey", reg_close_key);
@@ -925,6 +926,52 @@ pub fn register(d: &mut WinCeDispatcher) {
             return Ok(DispatchOutcome::ReturnedR0(ERROR_MORE_DATA));
         }
         ctx.cpu.write_mem(data, &bytes)?;
+        Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    fn reg_query_info_key_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let class_ptr = ctx.arg_u32(1)?;
+        let class_capacity = ctx.arg_u32(2)?;
+        let subkeys_ptr = ctx.arg_u32(3)?;
+        let max_subkey_len_ptr = ctx.arg_u32(4)?;
+        let max_class_len_ptr = ctx.arg_u32(5)?;
+        let values_ptr = ctx.arg_u32(6)?;
+        let max_value_name_len_ptr = ctx.arg_u32(7)?;
+        let max_value_len_ptr = ctx.arg_u32(8)?;
+        let security_ptr = ctx.arg_u32(9)?;
+        let last_write_ptr = ctx.arg_u32(10)?;
+
+        let Some(path) = ctx.kernel.registry.path_for(key) else {
+            return Ok(DispatchOutcome::ReturnedR0(ERROR_NOT_FOUND));
+        };
+        let _ = class_ptr;
+        let _ = class_capacity;
+        let _ = security_ptr;
+        let _ = last_write_ptr;
+        let subkey_count = 0u32;
+        let max_subkey_len = 0u32;
+        let max_class_len = 0u32;
+        let value_count = if ctx.kernel.registry.contains_key(&path) {
+            1
+        } else {
+            0
+        };
+        let max_value_name_len = 0u32;
+        let max_value_len = 0u32;
+        for (ptr, value) in [
+            (subkeys_ptr, subkey_count),
+            (max_subkey_len_ptr, max_subkey_len),
+            (max_class_len_ptr, max_class_len),
+            (values_ptr, value_count),
+            (max_value_name_len_ptr, max_value_name_len),
+            (max_value_len_ptr, max_value_len),
+        ] {
+            if ptr != 0 {
+                ctx.cpu.write_mem(ptr, &value.to_le_bytes())?;
+            }
+        }
+        log::debug!("RegQueryInfoKeyW({path}) -> values={value_count}");
         Ok(DispatchOutcome::ReturnedR0(0))
     }
 
@@ -8367,6 +8414,76 @@ fn bit_blt_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn stretch_blt_inner(
+    ctx: &mut CallCtx<'_>,
+    hdc_dst: u32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    hdc_src: u32,
+    sx: i32,
+    sy: i32,
+    sw: i32,
+    sh: i32,
+    rop: u32,
+) -> Result<(), KernelError> {
+    if dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
+        return Ok(());
+    }
+    let pat = ctx
+        .kernel
+        .gdi
+        .dc(hdc_dst)
+        .map(|d| colorref_to_rgb565(d.brush_color))
+        .unwrap_or(0);
+    let mut scratch = std::mem::take(&mut ctx.kernel.bit_blt_src_scratch);
+    let mut decode_scratch = std::mem::take(&mut ctx.kernel.dib_decode_scratch);
+    let (src_w, src_h, ok) = read_blit_source(ctx, hdc_src, &mut scratch, &mut decode_scratch);
+    log::debug!(
+        "StretchBlt source resolved: ok={ok} size={src_w}x{src_h} bytes={} nonzero={}",
+        scratch.len(),
+        scratch.iter().any(|&byte| byte != 0)
+    );
+    if hdc_dst == GDI_SCREEN_DC {
+        adapt_panel_to_presentation(ctx, dx, dy, dw, dh);
+    }
+    if ok && src_w != 0 && src_h != 0 {
+        if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
+            for y in 0..dh {
+                let source_y = sy + (y * sh / dh);
+                for x in 0..dw {
+                    let source_x = sx + (x * sw / dw);
+                    if source_x < 0
+                        || source_y < 0
+                        || source_x >= src_w as i32
+                        || source_y >= src_h as i32
+                    {
+                        continue;
+                    }
+                    let off = (source_y as usize * src_w as usize + source_x as usize) * 2;
+                    if off + 1 >= scratch.len() {
+                        continue;
+                    }
+                    let source = u16::from_le_bytes([scratch[off], scratch[off + 1]]);
+                    let destination = 0;
+                    let pixel = pocket_kernel::gdi::rop3::apply(rop, pat, source, destination);
+                    dst.put_pixel(dx + x, dy + y, pixel);
+                }
+            }
+            dst.mark_dirty();
+        }
+    }
+    ctx.kernel.bit_blt_src_scratch = scratch;
+    ctx.kernel.dib_decode_scratch = decode_scratch;
+    sync_dst_dib_to_guest(ctx, hdc_dst)?;
+    if hdc_dst == GDI_SCREEN_DC {
+        ctx.kernel.framebuffer.mark_dirty();
+    }
+    Ok(())
+}
+
 /// Let the emulated panel take the shape of the surface the game
 /// presents to the screen.
 ///
@@ -10335,11 +10452,17 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     // stale R0 (usually 0) as its thread handle and every later
     // `WaitForSingleObject` / `TerminateThread` on it misses.
     saved_regs[0] = handle;
-    let stack_size = stack_size.min(0x100000);
+    // WinCE treats a zero or tiny requested size as a request for the
+    // process default, and several CRT worker entry points use more than
+    // one 4 KiB page before reaching their first wait. Mapping only the
+    // literal request makes the first deep prologue write below the
+    // allocation and starves the main thread before it can present the
+    // next frame.
+    let stack_size = stack_size.clamp(pocket_kernel::DEFAULT_STACK_SIZE, 0x100000);
     let stack_base = stack_top.saturating_sub(stack_size) & !0xfff;
     ctx.cpu.map_region(
-        stack_base,
-        pocket_cpu::round_up_to_page(stack_size),
+        stack_base.saturating_sub(0x2000),
+        pocket_cpu::round_up_to_page(stack_size.saturating_add(0x3000)),
         pocket_cpu::Prot::READ | pocket_cpu::Prot::WRITE,
     )?;
     let mut thread = GuestThread::new(
@@ -10612,10 +10735,10 @@ fn stretch_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hdc_src = ctx.arg_u32(5)?;
     let sx = ctx.arg_u32(6)? as i32;
     let sy = ctx.arg_u32(7)? as i32;
-    let _sw = ctx.arg_u32(8)? as i32;
-    let _sh = ctx.arg_u32(9)? as i32;
+    let sw = ctx.arg_u32(8)? as i32;
+    let sh = ctx.arg_u32(9)? as i32;
     let rop = ctx.arg_u32(10)?;
-    bit_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy, rop)?;
+    stretch_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy, sw, sh, rop)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
