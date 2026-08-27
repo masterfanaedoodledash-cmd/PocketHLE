@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [revert-88-fix/android-nsis-installer-import]
   pull_request:
-    branches: [main]
+    branches: [revert-88-fix/android-nsis-installer-import]
 
 env:
   CARGO_TERM_COLOR: always
